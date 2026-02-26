@@ -1,7 +1,7 @@
-# redgreen_vwap_plumbed.py
+# redgreen_plumbed.py
 # -*- coding: utf-8 -*-
 """
-Red-Green simplified engine with VWAP-style MARKET order + robust LTP plumbing.
+Red-Green simplified engine MARKET order + robust LTP plumbing.
 Sells all lots at once (single exit by target or SL). CONFIRMS fills via positions/tradeBook.
 """
 import os, csv, json, time, threading, traceback, requests
@@ -30,8 +30,8 @@ TELEGRAM_BOT_TOKEN = "7956122666:AAGha1NuYZhL2v145JKCAcoE_v3qdF3__AE"
 ALLOWED_CHAT_ID = 967501394
 
 # Files
-TRADE_LOG_FILE  = "RAHUL/VWAP_RedGreen_log.csv"
-TRADE_LOG_XLSX  = "RAHUL/VWAP_RedGreen_log.xlsx"
+TRADE_LOG_FILE  = "RAHUL/RedGreen_log.csv"
+TRADE_LOG_XLSX  = "RAHUL/RedGreen_log_with_chart.xlsx"
 
 
 STATE_PERSIST_FILE = "RAHUL/Rahul_bot_state.json"
@@ -40,15 +40,16 @@ SPOT_TOKEN   = "26009"   # nominal fallback
 
 
 LOT_SIZE             = 60
-TARGET_POINTS        = 16
-SL_POINTS            = 15
+TARGET_POINTS        = 20
+SL_POINTS            = 18
 BROKERAGE_TAX        = 60
 SLEEP_INTERVAL       = 1
 PRE_CLOSE_BUFFER_SEC = 30
-DAILY_TRADE_LIMIT    = 1
+DAILY_TRADE_LIMIT    = 10
 
 
 RUN_FLAG = True
+PROGRAM_RUNNING = True
 
 #new code added to fix rate limit and wrong entries
 API_MIN_GAP = 0.35  # seconds (≈ 3 calls/sec total)
@@ -402,41 +403,154 @@ def _tg_send_photo(path: str, caption: str = "") -> bool:
         return False
 
 def _telegram_listener():
+    global RUN_FLAG, PROGRAM_RUNNING
+
     base = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
-    offset = None
+    # Flush old messages at startup
     try:
-        resp = requests.get(f"{base}/getUpdates", params={"timeout":1,"offset":0}, timeout=5)
-        data = resp.json()
-        if data.get("ok") and data.get("result"):
-            offset = data["result"][-1]["update_id"] + 1
+        init_resp = requests.get(
+            f"{base}/getUpdates",
+            params={"timeout": 1},
+            timeout=5
+        )
+        init_data = init_resp.json()
+        if "result" in init_data and init_data["result"]:
+            offset = init_data["result"][-1]["update_id"] + 1
+        else:
+            offset = None
     except Exception:
-        pass
-    print("📲 Telegram control armed. Send /stop to pause, /startbot to resume.")
-    while True:
+        offset = None
+    print("📲 Telegram control armed. Commands: /stop /startbot /status")
+
+    while PROGRAM_RUNNING:
         try:
-            resp = requests.get(f"{base}/getUpdates", params={"timeout":50,"offset":offset or 0}, timeout=60)
+            resp = requests.get(
+                f"{base}/getUpdates",
+                params={"timeout": 50, "offset": offset or 0},
+                timeout=60
+            )
+
             data = resp.json()
+
             for upd in data.get("result", []):
                 offset = upd["update_id"] + 1
                 msg = upd.get("message") or upd.get("edited_message")
-                if not msg: continue
+                if not msg:
+                    continue
+
                 chat_id = msg.get("chat", {}).get("id")
                 text = (msg.get("text") or "").strip().lower()
-                if chat_id != ALLOWED_CHAT_ID: continue
+
+                if chat_id != ALLOWED_CHAT_ID:
+                    continue
+
+                # ======================
+                # STOP COMMAND
+                # ======================
                 if text in ("/stop", "stop", "/kill", "kill"):
-                    global RUN_FLAG
                     RUN_FLAG = False
-                    print("🔴 Telegram: PAUSE command received.")
-                    try: requests.post(f"{base}/sendMessage", data={"chat_id": chat_id, "text": "🔴 Bot paused. No new entries. Will square-off if holding."}, timeout=10)
-                    except Exception: pass
+                    PROGRAM_RUNNING = False
+
+                    print("🔴 Telegram: FULL STOP command received.")
+
+                    requests.post(
+                        f"{base}/sendMessage",
+                        data={
+                            "chat_id": chat_id,
+                            "text": "🔴 Bot fully stopped."
+                        },
+                        timeout=10
+                    )
+                # ======================
+                # START COMMAND
+                # ======================
                 elif text in ("/startbot", "/resume", "resume", "startbot"):
                     RUN_FLAG = True
                     print("🟢 Telegram: RESUME command received.")
-                    try: requests.post(f"{base}/sendMessage", data={"chat_id": chat_id, "text": "🟢 Bot resumed."}, timeout=10)
-                    except Exception: pass
+
+                    requests.post(
+                        f"{base}/sendMessage",
+                        data={
+                            "chat_id": chat_id,
+                            "text": "🟢 Bot resumed."
+                        },
+                        timeout=10
+                    )
+
+                # ======================
+                # STATUS COMMAND
+                # ======================
+                elif text in ("/status", "status"):
+
+                    ce = ENGINES.get("CE")
+                    pe = ENGINES.get("PE")
+
+                    status_msg = "📊 Red-Green Bot Status\n\n"
+
+                    # Bot State
+                    status_msg += f"Engine State: {'🟢 Running' if RUN_FLAG else '🔴 Paused'}\n\n"
+
+                    # CE Status
+                    if ce and ce.in_position:
+                        try:
+                            ltp = float(
+                                _api_call(lambda: obj.ltpData("NFO", ce.symbol, ce.token), retries=2)["data"]["ltp"]
+                            )
+                        except Exception:
+                            ltp = 0
+
+                        status_msg += (
+                            f"CE ACTIVE\n"
+                            f"Symbol: {ce.symbol}\n"
+                            f"Entry: {ce.entry:.2f}\n"
+                            f"LTP: {ltp:.2f}\n"
+                            f"Target: {ce.target:.2f}\n"
+                            f"SL: {ce.sl:.2f}\n\n"
+                        )
+                    else:
+                        status_msg += "CE: No Active Trade\n\n"
+
+                    # PE Status
+                    if pe and pe.in_position:
+                        try:
+                            ltp = float(
+                                _api_call(lambda: obj.ltpData("NFO", pe.symbol, pe.token), retries=2)["data"]["ltp"]
+                            )
+                        except Exception:
+                            ltp = 0
+
+                        status_msg += (
+                            f"PE ACTIVE\n"
+                            f"Symbol: {pe.symbol}\n"
+                            f"Entry: {pe.entry:.2f}\n"
+                            f"LTP: {ltp:.2f}\n"
+                            f"Target: {pe.target:.2f}\n"
+                            f"SL: {pe.sl:.2f}\n\n"
+                        )
+                    else:
+                        status_msg += "PE: No Active Trade\n\n"
+
+                    # Stats
+                    with STATS_LOCK:
+                        total = STATS["total_trades"]
+                        gp = STATS["gross_profit"]
+                        gl = STATS["gross_loss"]
+
+                    net = gp - gl
+
+                    status_msg += (
+                        f"Trades Today: {total}\n"
+                        f"Net PnL: ₹{net:.0f}\n"
+                    )
+
+                    requests.post(
+                        f"{base}/sendMessage",
+                        data={"chat_id": chat_id, "text": status_msg},
+                        timeout=10
+                    )
+
         except Exception:
             time.sleep(3)
-
 # ===== Scrip-master loader & robust LTP =====
 def _load_scrip_master(force: bool = False, ttl_seconds: int = 300):
     global _scrip_master_cache, _scrip_master_last_load
@@ -734,6 +848,33 @@ def _avg_buy_price_from_tradebook(tb, token_str):
             return float(total_amt / total_qty)
     except Exception:
         pass
+    return 0.0
+
+def _avg_sell_price_from_tradebook(tb, token_str):
+    try:
+        rows = tb.get("data", []) if isinstance(tb, dict) else (tb if isinstance(tb, list) else [])
+        total_qty = 0
+        total_amt = 0.0
+
+        for t in rows or []:
+            tok = str(t.get("symboltoken") or t.get("token") or "")
+            if tok != str(token_str):
+                continue
+
+            side = (t.get("transactiontype") or t.get("tradetype") or "").upper()
+            qty = int(float(t.get("quantity") or 0))
+            price = float(t.get("price") or t.get("tradeprice") or 0.0)
+
+            if side == "SELL" and qty > 0:
+                total_qty += qty
+                total_amt += qty * price
+
+        if total_qty > 0:
+            return float(total_amt / total_qty)
+
+    except Exception:
+        pass
+
     return 0.0
 
 def _net_exec_qty_from_tradebook(tb, token_str):
@@ -1056,6 +1197,8 @@ class RedGreenEngine(threading.Thread):
         wait_seconds = max(0, int((next_candle_time - now).total_seconds()))
         print(f"[{self.name}] ⏳ Sleeping until next 3-min candle at {next_candle_time.strftime('%H:%M:%S')} ({wait_seconds} sec)...")
         for remaining in range(wait_seconds, 0, -1):
+            if not PROGRAM_RUNNING:
+                return
             if _market_closed():
                 print("")
                 break
@@ -1120,11 +1263,33 @@ class RedGreenEngine(threading.Thread):
         # VOLUME BASELINE FILTER
         # ============================
 
+        print(
+        f"[{self.name}] Structure → "
+        f"Body: {body:.2f} | Range: {range_size:.2f} | "
+        f"LowerWick: {lower_wick:.2f} | UpperWick: {upper_wick:.2f}"
+        )
         baseline_vol = df["volume"].iloc[-6:-2].mean()
 
-        if curr["volume"] < baseline_vol * 1.2:
+        # Allow either:
+        # 1. Volume expansion vs previous candle
+        # OR
+        # 2. Stronger than recent baseline
+        print(
+            f"[{self.name}] Volume Check → "
+            f"Prev: {prev['volume']} | "
+            f"Curr: {curr['volume']} | "
+            f"Baseline Avg: {baseline_vol:.0f}"
+        )
+
+        if not (
+            curr["volume"] > prev["volume"] or
+            curr["volume"] > baseline_vol * 1.05
+        ):
+            print(f"[{self.name}] ❌ Volume condition FAILED")
             return False
 
+        print(f"[{self.name}] ✅ Volume condition PASSED")
+        
         # Trading window checks
         if not RUN_FLAG or not _entry_window_open() or _market_closed():
             return False
@@ -1286,17 +1451,27 @@ class RedGreenEngine(threading.Thread):
             qty = self.position_qty or LOT_SIZE
             print(f"[{self.name}] placing MARKET SELL qty={qty} symbol={self.symbol} token={self.token}")
             sold_qty = place_market_and_confirm_sell(self.symbol, self.token, qty, timeout_sec=25, poll_sec=1.0)
-            if sold_qty > 0:
-                try:
-                    exit_px = float(_api_call(lambda: obj.ltpData("NFO", self.symbol, self.token), retries=2)["data"]["ltp"])
-                except Exception:
-                    exit_px = self.entry
-            else:
-                # fallback estimation
-                try:
-                    exit_px = float(_api_call(lambda: obj.ltpData("NFO", self.symbol, self.token), retries=2)["data"]["ltp"])
-                except Exception:
-                    exit_px = self.entry
+            
+            # Get actual SELL average price from tradeBook
+            exit_px = self.entry  # fallback safety
+
+            try:
+                tb = _api_call(lambda: obj.tradeBook(), retries=3)
+                avg_sell = _avg_sell_price_from_tradebook(tb, self.token)
+
+                if avg_sell and avg_sell > 0:
+                    exit_px = float(avg_sell)
+                else:
+                    print(f"[{self.name}] WARNING: Could not extract sell avg from tradeBook. Using LTP fallback.")
+                    try:
+                        exit_px = float(
+                            _api_call(lambda: obj.ltpData("NFO", self.symbol, self.token), retries=2)["data"]["ltp"]
+                        )
+                    except Exception:
+                        exit_px = self.entry
+
+            except Exception as e:
+                print(f"[{self.name}] tradeBook fetch failed: {e}")
 
             self._exit_and_log(exit_px, reason)
             return True
@@ -1317,7 +1492,7 @@ class RedGreenEngine(threading.Thread):
 
     def run(self):
         print(f"[{self.name}] Engine started.")
-        while True:
+        while PROGRAM_RUNNING:
             try:
                 if _market_closed():
                     if self.in_position:
@@ -1495,7 +1670,7 @@ if __name__ == "__main__":
     if TELEGRAM_BOT_TOKEN and ALLOWED_CHAT_ID:
         threading.Thread(target=_telegram_listener, daemon=True).start()
     now_t = datetime.now().time()
-    if not (_time(8,30) <= now_t <= _time(15,30)):
+    if not (_time(00,30) <= now_t <= _time(15,30)):
         print("🛑 Market closed. Stopping strategy execution.")
         RUN_FLAG = False
         time.sleep(2)
@@ -1512,9 +1687,9 @@ if __name__ == "__main__":
     except Exception:
         pass
     try:
-        while True:
+        while PROGRAM_RUNNING:
             now_t = datetime.now().time()
-            if _market_closed() or not (_time(8,30) <= now_t <= _time(15,30)):
+            if _market_closed() or not (_time(00,30) <= now_t <= _time(15,30)):
                 print("🛑 Market closed. Stopping strategy execution.")
                 RUN_FLAG = False
                 time.sleep(3)
