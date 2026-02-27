@@ -45,7 +45,7 @@ SL_POINTS            = 18
 BROKERAGE_TAX        = 60
 SLEEP_INTERVAL       = 1
 PRE_CLOSE_BUFFER_SEC = 30
-DAILY_TRADE_LIMIT    = 10
+DAILY_TRADE_LIMIT    = 13
 
 
 RUN_FLAG = True
@@ -779,16 +779,13 @@ def fetch_candle_data(token):
     if now < market_start + timedelta(minutes=3):
         return None
 
-    # 🔥 Always use LAST COMPLETED 3-min candle
+    # 🔥 Use LAST COMPLETED 3-min candle (correct alignment)
     minute_block = (now.minute // 3) * 3
     safe_to_time = now.replace(minute=minute_block, second=0, microsecond=0)
 
-    # Always step back one full 3-minute candle
-    safe_to_time -= timedelta(minutes=3)
-
-    # Extra safety (never future)
-    if safe_to_time > now:
-        safe_to_time = now - timedelta(minutes=3)
+    # If alignment points to current forming candle, step back one candle
+    if safe_to_time >= now:
+        safe_to_time -= timedelta(minutes=3)
 
     params = {
         "exchange": "NFO",
@@ -896,8 +893,9 @@ def _get_open_qty(symbol_token):
     try:
         pos = _api_call(lambda: obj.position(), retries=3)
         return _extract_net_position_from_positions(pos, symbol_token)
-    except Exception:
-        return 0
+    except Exception as e:
+        print(f"[Position Check] position() API failed: {e}")
+        return None  # IMPORTANT: return None instead of 0
 
 def _persist_state():
     try:
@@ -1361,7 +1359,7 @@ class RedGreenEngine(threading.Thread):
         self._exiting = False
 
         with DAY_STATE_LOCK:
-            DAY_HAS_TRADE = True
+            #DAY_HAS_TRADE = True
             TRADING_ENGINE_ACTIVE = False
 
         print(f"[{self.name}] ✅ Entered @ {self.entry} | Qty {self.position_qty} | Tgt {self.target} | SL {self.sl} | Symbol {self.symbol}")
@@ -1492,45 +1490,60 @@ class RedGreenEngine(threading.Thread):
 
     def run(self):
         print(f"[{self.name}] Engine started.")
+
         while PROGRAM_RUNNING:
             try:
+                # ============================
+                # Market Close Handling
+                # ============================
                 if _market_closed():
                     if self.in_position:
                         try:
                             self._sell_and_exit("MKT_CLOSE")
                         except Exception as e:
                             print(f"[{self.name}] error during MKT_CLOSE exit: {e}")
-                    time.sleep(2); continue
+                    time.sleep(2)
+                    continue
 
-                # fetch candles for token
+                # ============================
+                # Fetch ATM token
+                # ============================
                 try:
                     ce_sym, ce_tok, pe_sym, pe_tok, expiry = fetch_atm_cached()
+
                     if self.name == "CE":
                         self.symbol, self.token, self.expiry = ce_sym, ce_tok, expiry
                     else:
                         self.symbol, self.token, self.expiry = pe_sym, pe_tok, expiry
+
                 except Exception as e:
                     print(f"[{self.name}] token fetch error: {e}")
-                    self._sleep_until_next_3min(); continue
+                    self._sleep_until_next_3min()
+                    continue
 
-                df = None
+                # ============================
+                # Fetch Candles
+                # ============================
                 try:
                     df = fetch_candle_data(self.token)
                 except Exception as e:
                     print(f"[{self.name}] candle fetch error: {e}")
+                    df = None
 
                 if df is None:
-                    self._sleep_until_next_3min(); continue
+                    self._sleep_until_next_3min()
+                    continue
 
-                # If not in trade, try enter
+                # ============================
+                # ENTRY LOGIC
+                # ============================
                 if not self.in_position and RUN_FLAG and _entry_window_open():
-                    # Block if other leg already has an open position — we only want one live trade either CE or PE
+
                     if self._other_leg_in_position():
                         print(f"[{self.name}] Skipping entry because opposite leg already in trade.")
                         self._sleep_until_next_3min()
                         continue
 
-                    # ensure global trade-limits / one-trade-per-day gate
                     if _should_block_new_entries():
                         self._sleep_until_next_3min()
                         continue
@@ -1539,17 +1552,21 @@ class RedGreenEngine(threading.Thread):
                         entered = self._detect_and_enter(df)
                         if entered:
                             self.in_position = True
-                            print(f"[{self.name}] ✅ Entered @ {self.entry} | Qty {self.position_qty} | Tgt {self.target} | SL {self.sl} | Symbol {self.symbol}")
                     except Exception as e:
                         print(f"[{self.name}] enter error: {e}")
 
-                # If in trade, monitor for exit
+                # ============================
+                # MONITOR TRADE
+                # ============================
                 while self.in_position and not _market_closed():
+
+                    # Manual exit request
                     req = None
                     with self._exit_req_lock:
                         if self._exit_request:
                             req = self._exit_request
                             self._exit_request = None
+
                     if req:
                         self._sell_and_exit(req)
                         break
@@ -1557,34 +1574,66 @@ class RedGreenEngine(threading.Thread):
                     if not RUN_FLAG:
                         self._sell_and_exit("PAUSE_EXIT")
                         break
+
                     try:
-                        ltp = float(_api_call(lambda: obj.ltpData("NFO", self.symbol, self.token), retries=2)["data"]["ltp"])
-                        print(f"✅[{self.name}] LTP {ltp:.2f} | Qty {self.position_qty} | Tgt {self.target} | SL {self.sl} | Symbol {self.symbol}")
+                        ltp = float(
+                            _api_call(lambda: obj.ltpData("NFO", self.symbol, self.token), retries=2)["data"]["ltp"]
+                        )
+
+                        print(
+                            f"✅[{self.name}] LTP {ltp:.2f} | Qty {self.position_qty} "
+                            f"| Tgt {self.target} | SL {self.sl} | Symbol {self.symbol}"
+                        )
+
+                        # =====================================
+                        # 🔥 AUTO SQUARE-OFF DETECTION
+                        # =====================================
+                        open_qty = _get_open_qty(self.token)
+
+                        if open_qty is not None and open_qty == 0:
+                            print(f"[{self.name}] 🔔 Broker auto square-off detected.")
+
+                            try:
+                                tb = _api_call(lambda: obj.tradeBook(), retries=3)
+                                avg_sell = _avg_sell_price_from_tradebook(tb, self.token)
+                                exit_px = float(avg_sell) if avg_sell else self.entry
+                            except Exception:
+                                exit_px = self.entry
+
+                            self._exit_and_log(exit_px, "AUTO_SQOFF")
+                            self.in_position = False
+                            break
+                        # =====================================
+
+                        # Normal Exit Conditions
                         if ltp >= self.target:
                             self._sell_and_exit("TARGET")
                             break
+
                         if ltp <= self.sl:
                             self._sell_and_exit("STOPLOSS")
                             break
+
                     except Exception as e:
                         print(f"[{self.name}] monitor error: {e}")
+
                     time.sleep(SLEEP_INTERVAL)
 
-                # After any exits, if both legs are flat and limits reached, stop for the day
+                # ============================
+                # Stop for the day if needed
+                # ============================
                 if _both_legs_flat() and _should_block_new_entries():
                     _stop_for_the_day("(both legs are flat)")
+
                 self._sleep_until_next_3min()
 
             except Exception as ex_main:
-                # Catch-all so thread doesn't die on uncaught exception (e.g. JSON parse from broker)
                 print(f"[{self.name}] Unexpected error in run loop: {ex_main}")
-                # release active trading flag so other engine can try later (best-effort)
+
                 with DAY_STATE_LOCK:
-                    try:
-                        global TRADING_ENGINE_ACTIVE
-                        TRADING_ENGINE_ACTIVE = False
-                    except Exception:
-                        pass
+                    global TRADING_ENGINE_ACTIVE
+                    TRADING_ENGINE_ACTIVE = False
+
                 time.sleep(5)
                 continue
 
@@ -1598,14 +1647,16 @@ def _both_legs_flat() -> bool:
 
 def _should_block_new_entries() -> bool:
     try:
-        if DAY_HAS_TRADE:
-            return True
+        # Only respect DAILY_TRADE_LIMIT
         if _compute_today_trade_count_from_csv(TRADE_LOG_FILE) >= DAILY_TRADE_LIMIT:
             return True
+
         with STATS_LOCK:
-            if STATS.get("total_trades",0) >= DAILY_TRADE_LIMIT:
+            if STATS.get("total_trades", 0) >= DAILY_TRADE_LIMIT:
                 return True
+
         return False
+
     except Exception:
         return False
 
