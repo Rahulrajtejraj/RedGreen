@@ -7,7 +7,7 @@ Sells all lots at once (single exit by target or SL). CONFIRMS fills via positio
 import os, csv, json, time, threading, traceback, requests
 from datetime import datetime, timedelta, time as _time
 from typing import Any, Callable
-import pandas as pd
+import pandas as pd 
 import pandas as _pd
 import matplotlib
 matplotlib.use("Agg")
@@ -18,6 +18,11 @@ from openpyxl.drawing.image import Image as _XLImage
 # SmartAPI + TOTP
 from SmartApi import SmartConnect
 import pyotp
+
+import requests
+from datetime import datetime
+
+
 
 # ===================== USER CONFIG =====================
 API_KEY      = "rugItMz0"
@@ -57,6 +62,23 @@ PROGRAM_RUNNING = True
 API_MIN_GAP = 0.45  # seconds (≈ 3 calls/sec total)
 _last_api_call_ts = 0.0
 _api_gap_lock = threading.Lock()
+
+
+def send_vps_boot_alert():
+    message = f"""
+🚀 VPS BOOT DETECTED
+Bot started at: {datetime.now()}
+Server: Lightsail Mumbai
+"""
+    requests.get(
+        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+        params={
+            "chat_id": ALLOWED_CHAT_ID,
+            "text": message
+        }
+    )
+
+send_vps_boot_alert()
 
 def _throttled_call(fn):
     def wrapped(*a, **k):
