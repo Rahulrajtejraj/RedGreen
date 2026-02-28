@@ -32,8 +32,6 @@ ALLOWED_CHAT_ID = 967501394
 # Files
 TRADE_LOG_FILE  = "RAHUL/RedGreen_log.csv"
 TRADE_LOG_XLSX  = "RAHUL/RedGreen_log_with_chart.xlsx"
-
-
 STATE_PERSIST_FILE = "RAHUL/Rahul_bot_state.json"
 SPOT_SYMBOL  = "BANKNIFTY"
 SPOT_TOKEN   = "26009"   # nominal fallback
@@ -43,16 +41,20 @@ LOT_SIZE             = 60
 TARGET_POINTS        = 20
 SL_POINTS            = 18
 BROKERAGE_TAX        = 60
-SLEEP_INTERVAL       = 1
+SLEEP_INTERVAL       = 0.5
 PRE_CLOSE_BUFFER_SEC = 30
-DAILY_TRADE_LIMIT    = 14
+DAILY_TRADE_LIMIT    = 20
 
+API_FAIL_COUNT = 0
+MAX_API_FAIL = 10
+API_FAIL_LOCK = threading.Lock()
+API_CIRCUIT_OPEN = False
 
 RUN_FLAG = True
 PROGRAM_RUNNING = True
 
 #new code added to fix rate limit and wrong entries
-API_MIN_GAP = 0.35  # seconds (≈ 3 calls/sec total)
+API_MIN_GAP = 0.45  # seconds (≈ 3 calls/sec total)
 _last_api_call_ts = 0.0
 _api_gap_lock = threading.Lock()
 
@@ -332,18 +334,39 @@ obj.orderBook = _throttled_call(obj.orderBook)
 obj.getCandleData = _throttled_call(obj.getCandleData)
 
 
-def _api_call(fn: Callable, *args, retries: int = 5, backoff: float = 1.0, allow_refresh: bool = True, **kwargs) -> Any:
+def _api_call(fn: Callable, *args, retries: int = 5, backoff: float = 1.0,
+              allow_refresh: bool = True, **kwargs) -> Any:
+
+    global API_FAIL_COUNT, API_CIRCUIT_OPEN
+
     attempt = 0
     last_exc = None
+
     while attempt < retries:
         try:
-            return fn(*args, **kwargs)
+            result = fn(*args, **kwargs)
+
+            # 🔵 SUCCESS → Reset fail counter
+            with API_FAIL_LOCK:
+                API_FAIL_COUNT = 0
+                API_CIRCUIT_OPEN = False
+
+            return result
+
         except Exception as e:
             last_exc = e
             attempt += 1
             msg = str(e).lower()
-            is_rate_limit = ("exceed" in msg and "rate" in msg) or "access denied" in msg or "rate limit" in msg or "too many" in msg
+
+            is_rate_limit = (
+                ("exceed" in msg and "rate" in msg)
+                or "access denied" in msg
+                or "rate limit" in msg
+                or "too many" in msg
+            )
+
             print(f"[api_call] attempt {attempt}/{retries} failed for {getattr(fn,'__name__',str(fn))}: {e}")
+
             if is_rate_limit:
                 sleep_for = min(60, backoff * (2 ** (attempt - 1))) + (0.2 * attempt)
                 sleep_for = sleep_for * (1.0 + (0.1 * attempt))
@@ -351,14 +374,40 @@ def _api_call(fn: Callable, *args, retries: int = 5, backoff: float = 1.0, allow
             else:
                 sleep_for = min(10, backoff * (2 ** (attempt - 1)))
                 print(f"[api_call] backing off {sleep_for:.1f}s before retrying...")
+
             if allow_refresh and ("session" in msg or "expired" in msg or "ab1004" in msg):
                 try:
                     _create_session()
                 except Exception:
                     pass
+
             time.sleep(sleep_for)
             continue
+
+    # 🔴 FINAL FAILURE → Increment circuit breaker
+    with API_FAIL_LOCK:
+        API_FAIL_COUNT += 1
+        print(f"[FAILSAFE] API_FAIL_COUNT = {API_FAIL_COUNT}")
+
+        if API_FAIL_COUNT >= MAX_API_FAIL:
+            API_CIRCUIT_OPEN = True
+            print("🚨 API CIRCUIT OPENED")
+
     raise last_exc
+
+def _api_circuit_monitor():
+    global RUN_FLAG
+
+    while PROGRAM_RUNNING:
+        with API_FAIL_LOCK:
+            if API_CIRCUIT_OPEN:
+                if RUN_FLAG:
+                    print("🚨 API CIRCUIT OPEN — Pausing Trading")
+                    RUN_FLAG = False
+                    _tg_send("🚨 API Circuit Open. Trading paused.")
+
+        time.sleep(3)
+
 
 # ===== Telegram helpers =====
 def _tg_send(text: str):
@@ -634,13 +683,12 @@ def fetch_atm_option_tokens():
     VOL_MIN_MULT_LOCAL = globals().get("VOL_MIN_MULT", 0.65)
 
     # fetch scrip master
-    url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
     try:
-        r = requests.get(url, timeout=8)
-        r.raise_for_status()
-        sm = pd.DataFrame(r.json())
+        sm = _load_scrip_master(ttl_seconds=600)  # cache for 5 minutes
+        if sm is None or sm.empty:
+            raise RuntimeError("Empty scrip master cache")
     except Exception as e:
-        raise RuntimeError(f"[fetch_atm_option_tokens] could not fetch scrip master: {e}")
+        raise RuntimeError(f"[fetch_atm_option_tokens] could not load cached scrip master: {e}")
 
     # filter for option rows of our symbol
     opt_df = sm[(sm.get("name") == SPOT_SYMBOL) & (sm.get("exch_seg") == "NFO") & (sm.get("instrumenttype") == "OPTIDX")].copy()
@@ -1221,7 +1269,8 @@ class RedGreenEngine(threading.Thread):
         return False
 
     def _detect_and_enter(self, df):
-        global TRADING_ENGINE_ACTIVE, DAY_HAS_TRADE
+        global TRADING_ENGINE_ACTIVE
+        # global DAY_HAS_TRADE
 
         # Basic safety
         if df is None or len(df) < 6:
@@ -1229,7 +1278,6 @@ class RedGreenEngine(threading.Thread):
 
         prev = df.iloc[-3]
         curr = df.iloc[-2]
-        #nxt  = df.iloc[-1]
 
         # --- Red-Green Condition ---
         if not (prev["close"] < prev["open"] and curr["close"] > curr["open"]):
@@ -1245,33 +1293,23 @@ class RedGreenEngine(threading.Thread):
         lower_wick = min(curr["open"], curr["close"]) - curr["low"]
         upper_wick = curr["high"] - max(curr["open"], curr["close"])
 
-        # Reject very small/noise candles
         if range_size < 5:
             return False
 
-        # Reject strong upper rejection (seller dominance)
         if upper_wick > body:
             return False
 
-        # Allow either strong body OR hammer-type absorption
         if not (body > range_size * 0.5 or lower_wick > body * 1.5):
             return False
 
-        # ============================
-        # VOLUME BASELINE FILTER
-        # ============================
-
         print(
-        f"[{self.name}] Structure → "
-        f"Body: {body:.2f} | Range: {range_size:.2f} | "
-        f"LowerWick: {lower_wick:.2f} | UpperWick: {upper_wick:.2f}"
+            f"[{self.name}] Structure → "
+            f"Body: {body:.2f} | Range: {range_size:.2f} | "
+            f"LowerWick: {lower_wick:.2f} | UpperWick: {upper_wick:.2f}"
         )
+
         baseline_vol = df["volume"].iloc[-6:-2].mean()
 
-        # Allow either:
-        # 1. Volume expansion vs previous candle
-        # OR
-        # 2. Stronger than recent baseline
         print(
             f"[{self.name}] Volume Check → "
             f"Prev: {prev['volume']} | "
@@ -1287,35 +1325,30 @@ class RedGreenEngine(threading.Thread):
             return False
 
         print(f"[{self.name}] ✅ Volume condition PASSED")
-        
-        # Trading window checks
+
         if not RUN_FLAG or not _entry_window_open() or _market_closed():
             return False
 
-        # Prevent simultaneous entries
-        with DAY_STATE_LOCK:
-            if TRADING_ENGINE_ACTIVE:
-                return False
-            TRADING_ENGINE_ACTIVE = True
-
-        # Fetch ATM tokens
-        try:
-            ce_sym, ce_tok, pe_sym, pe_tok, expiry = fetch_atm_cached()
-
-            if self.name == "CE":
-                self.symbol, self.token, self.expiry = ce_sym, ce_tok, expiry
-            else:
-                self.symbol, self.token, self.expiry = pe_sym, pe_tok, expiry
-
-        except Exception as e:
-            print(f"[{self.name}] token fetch error: {e}")
-            with DAY_STATE_LOCK:
-                TRADING_ENGINE_ACTIVE = False
+        # Ensure token already available (avoid redundant API calls)
+        if not self.symbol or not self.token:
+            print(f"[{self.name}] No token available for entry.")
             return False
 
-        # Place MARKET BUY
+        # =============================
+        # ENTRY LOCK (SAFE VERSION)
+        # =============================
+        acquired = False
+        with DAY_STATE_LOCK:
+            if not TRADING_ENGINE_ACTIVE:
+                TRADING_ENGINE_ACTIVE = True
+                acquired = True
+
+        if not acquired:
+            return False
+
         try:
             print(f"[Order] placing MARKET BUY qty={LOT_SIZE} symbol={self.symbol} token={self.token}")
+
             res = place_market_and_confirm_buy(
                 self.symbol,
                 self.token,
@@ -1325,62 +1358,119 @@ class RedGreenEngine(threading.Thread):
                 poll_sec=1.0,
                 persist_on_confirm=True
             )
+
             print(f"[{self.name}] BUY order result: {res}")
             self._current_order_id = res.get("order_id")
 
+            if not res or not res.get("ok", False):
+                print(f"[{self.name}] No fill received for BUY; not entering position.")
+                return False
+
+            filled = int(res.get("filled_qty", 0))
+            avg = res.get("avg_price", None)
+
+            if not avg or avg <= 0:
+                try:
+                    avg = float(
+                        _api_call(lambda: obj.ltpData("NFO", self.symbol, self.token), retries=2)["data"]["ltp"]
+                    )
+                except Exception:
+                    avg = float(curr["close"])
+
+            self.position_qty = filled if filled > 0 else LOT_SIZE
+            self.entry = float(avg)
+            self.target = round(self.entry + TARGET_POINTS, 2)
+            self.sl = round(self.entry - SL_POINTS, 2)
+            self.entry_volume = int(curr["volume"]) if "volume" in curr.index else 0
+            self.in_position = True
+            self._exiting = False
+
+            print(
+                f"[{self.name}] ✅ Entered @ {self.entry} | "
+                f"Qty {self.position_qty} | "
+                f"Tgt {self.target} | SL {self.sl} | Symbol {self.symbol}"
+            )
+
+            return True
+
         except Exception as e:
-            print(f"[{self.name}] place/confirm exception: {e}")
-            with DAY_STATE_LOCK:
-                TRADING_ENGINE_ACTIVE = False
+            print(f"[{self.name}] ENTRY EXCEPTION: {e}")
             return False
 
-        if not res or not res.get("ok", False):
+        finally:
+            # ALWAYS RELEASE ENTRY LOCK
             with DAY_STATE_LOCK:
                 TRADING_ENGINE_ACTIVE = False
-            print(f"[{self.name}] No fill received for BUY; not entering position.")
-            return False
-
-        # Confirmed fill
-        filled = int(res.get("filled_qty", 0))
-        avg = res.get("avg_price", None)
-
-        if not avg or avg <= 0:
-            try:
-                avg = float(_api_call(lambda: obj.ltpData("NFO", self.symbol, self.token), retries=2)["data"]["ltp"])
-            except Exception:
-                avg = float(curr["close"])
-
-        self.position_qty = filled if filled > 0 else LOT_SIZE
-        self.entry = float(avg)
-        self.target = round(self.entry + TARGET_POINTS, 2)
-        self.sl     = round(self.entry - SL_POINTS, 2)
-        self.entry_volume = int(curr["volume"]) if "volume" in curr.index else 0
-        self.in_position = True
-        self._exiting = False
-
-        with DAY_STATE_LOCK:
-            #DAY_HAS_TRADE = True
-            TRADING_ENGINE_ACTIVE = False
-
-        print(f"[{self.name}] ✅ Entered @ {self.entry} | Qty {self.position_qty} | Tgt {self.target} | SL {self.sl} | Symbol {self.symbol}")
-
-        return True
+    
 
     def _exit_and_log(self, exit_price, reason):
         qty = self.position_qty if self.position_qty > 0 else LOT_SIZE
-        gross_pnl = (exit_price - self.entry) * qty
-        net_pnl = gross_pnl - BROKERAGE_TAX
+
+        # -------------------------------------------------
+        # 1️⃣ Try broker REALISED PnL first
+        # -------------------------------------------------
+        net_pnl = None
 
         try:
-            log_trade(self.symbol, "BUY", "Red-Green",
-                    trigger_price=self.entry, entry_price=self.entry,
-                    target_price=self.target, sl_price=self.sl,
-                    exit_price=exit_price, result=reason, pnl=net_pnl,
-                    volume=self.entry_volume,
-                    expiry=self.expiry)
+            pos = _api_call(lambda: obj.position(), retries=2)
+
+            rows = pos.get("data", []) if isinstance(pos, dict) else []
+
+            if isinstance(rows, dict) and "netPositions" in rows:
+                rows = rows["netPositions"]
+
+            for r in rows:
+                tok = str(r.get("symboltoken") or r.get("token") or "")
+                if tok == str(self.token):
+
+                    realised = (
+                        r.get("realisedpnl")
+                        or r.get("realisedPnl")
+                        or r.get("pnl")
+                        or 0
+                    )
+
+                    try:
+                        net_pnl = float(realised)
+                    except Exception:
+                        net_pnl = None
+
+                    break
+
+        except Exception as e:
+            print(f"[{self.name}] position() PnL fetch failed: {e}")
+
+        # -------------------------------------------------
+        # 2️⃣ Fallback to manual calculation
+        # -------------------------------------------------
+        if net_pnl is None:
+            gross_pnl = (exit_price - self.entry) * qty
+            net_pnl = gross_pnl - BROKERAGE_TAX
+
+        # -------------------------------------------------
+        # 3️⃣ Log trade
+        # -------------------------------------------------
+        try:
+            log_trade(
+                self.symbol,
+                "BUY",
+                "Red-Green",
+                trigger_price=self.entry,
+                entry_price=self.entry,
+                target_price=self.target,
+                sl_price=self.sl,
+                exit_price=exit_price,
+                result=reason,
+                pnl=net_pnl,
+                volume=self.entry_volume,
+                expiry=self.expiry
+            )
         except Exception as e:
             print(f"[{self.name}] log_trade failed (continuing): {e}")
 
+        # -------------------------------------------------
+        # 4️⃣ Stats + Chart + Telegram
+        # -------------------------------------------------
         try:
             _update_stats_with_pnl(net_pnl)
             print_trade_summary()
@@ -1397,7 +1487,7 @@ class RedGreenEngine(threading.Thread):
                     print("[Chart] Built successfully.")
                     print("[Chart] Waiting 5 seconds before sending to Telegram...")
 
-                    time.sleep(5)  # 🔥 Telegram buffer delay
+                    time.sleep(5)
 
                     sent = _tg_send_photo(png, caption="📊 Updated Daily PnL Chart")
 
@@ -1420,7 +1510,8 @@ class RedGreenEngine(threading.Thread):
                     gp = STATS["gross_profit"]
                     gl = STATS["gross_loss"]
             except Exception:
-                t=w=l=0; gp=gl=0.0
+                t = w = l = 0
+                gp = gl = 0.0
 
             try:
                 msg = (
@@ -1432,7 +1523,9 @@ class RedGreenEngine(threading.Thread):
                     f"📊 Totals — Trades: {t} | Win: {w} | Loss: {l}\n"
                     f"Profit: ₹{gp:.0f} | Loss: ₹{gl:.0f}"
                 )
+
                 _tg_send(msg)
+
             except Exception:
                 pass
 
@@ -1449,13 +1542,17 @@ class RedGreenEngine(threading.Thread):
             qty = self.position_qty or LOT_SIZE
             print(f"[{self.name}] placing MARKET SELL qty={qty} symbol={self.symbol} token={self.token}")
             sold_qty = place_market_and_confirm_sell(self.symbol, self.token, qty, timeout_sec=25, poll_sec=1.0)
-            
+            if sold_qty <= 0:
+                print(f"[{self.name}] ⚠ SELL not confirmed — position may still be open!")
             # Get actual SELL average price from tradeBook
             exit_px = self.entry  # fallback safety
 
             try:
-                tb = _api_call(lambda: obj.tradeBook(), retries=3)
-                avg_sell = _avg_sell_price_from_tradebook(tb, self.token)
+                try:
+                    tb = _api_call(lambda: obj.tradeBook(), retries=2)
+                    avg_sell = _avg_sell_price_from_tradebook(tb, self.token)
+                except Exception:
+                    avg_sell = None
 
                 if avg_sell and avg_sell > 0:
                     exit_px = float(avg_sell)
@@ -1559,7 +1656,9 @@ class RedGreenEngine(threading.Thread):
                 # MONITOR TRADE
                 # ============================
                 while self.in_position and not _market_closed():
-
+                    if API_CIRCUIT_OPEN:
+                        print(f"[{self.name}] Circuit open — stopping monitor loop.")
+                        break
                     # Manual exit request
                     req = None
                     with self._exit_req_lock:
@@ -1718,6 +1817,7 @@ ENGINES = {}
 if __name__ == "__main__":
     _init_stats_from_csv(TRADE_LOG_FILE)
     _load_state()
+    threading.Thread(target=_api_circuit_monitor, daemon=True).start()
     if TELEGRAM_BOT_TOKEN and ALLOWED_CHAT_ID:
         threading.Thread(target=_telegram_listener, daemon=True).start()
     now_t = datetime.now().time()
