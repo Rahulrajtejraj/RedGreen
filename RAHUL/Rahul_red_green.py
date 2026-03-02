@@ -80,6 +80,34 @@ Server: Lightsail Mumbai
 
 send_vps_boot_alert()
 
+import requests
+from datetime import datetime
+import socket
+
+def send_start_notification():
+    try:
+        hostname = socket.gethostname()
+        message = f"""
+🚀 Daily Auto Start Triggered – 09:00 IST
+
+Bot Started Successfully
+Time: {datetime.now().strftime('%d-%m-%Y %H:%M:%S')}
+Server: {hostname}
+"""
+
+        requests.get(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            params={
+                "chat_id": ALLOWED_CHAT_ID,
+                "text": message
+            },
+            timeout=10
+        )
+
+    except Exception as e:
+        print("Startup notification failed:", e)
+
+
 def _throttled_call(fn):
     def wrapped(*a, **k):
         global _last_api_call_ts
@@ -118,7 +146,7 @@ _scrip_master_lock = threading.Lock()
 def _today_str(): return datetime.now().date().isoformat()
 def _entry_window_open() -> bool:
     now_t = datetime.now().time()
-    return (_time(0,0) <= now_t < _time(15,30))
+    return (_time(8,45) <= now_t < _time(15,30))
 def _market_closed():
     cutoff = (datetime.now().replace(hour=15, minute=30, second=0, microsecond=0)
               - timedelta(seconds=PRE_CLOSE_BUFFER_SEC))
@@ -1843,7 +1871,7 @@ if __name__ == "__main__":
     if TELEGRAM_BOT_TOKEN and ALLOWED_CHAT_ID:
         threading.Thread(target=_telegram_listener, daemon=True).start()
     now_t = datetime.now().time()
-    if not (_time(00,30) <= now_t <= _time(15,30)):
+    if not (_time(8,45) <= now_t <= _time(15,30)):
         print("🛑 Market closed. Stopping strategy execution.")
         RUN_FLAG = False
         time.sleep(2)
@@ -1862,7 +1890,7 @@ if __name__ == "__main__":
     try:
         while PROGRAM_RUNNING:
             now_t = datetime.now().time()
-            if _market_closed() or not (_time(00,30) <= now_t <= _time(15,30)):
+            if _market_closed() or not (_time(8,45) <= now_t <= _time(15,30)):
                 print("🛑 Market closed. Stopping strategy execution.")
                 RUN_FLAG = False
                 time.sleep(3)
