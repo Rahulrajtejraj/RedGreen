@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Red-Green simplified engine MARKET order + robust LTP plumbing.
-Sells all lots at once (single exit by target or SL).  CONFIRMS fills via positions/tradeBook.
+Sells all lots at once (single exit by target or SL). CONFIRMS fills via positions/tradeBook.
 """
 import json
 import time
