@@ -4,6 +4,8 @@
 Red-Green simplified engine MARKET order + robust LTP plumbing.
 Sells all lots at once (single exit by target or SL). CONFIRMS fills via positions/tradeBook.
 """
+import json
+import time
 import os, csv, json, time, threading, traceback, requests
 from datetime import datetime, timedelta, time as _time
 from typing import Any, Callable
@@ -20,8 +22,6 @@ from SmartApi import SmartConnect
 import pyotp
 
 import requests
-from datetime import datetime
-
 
 
 # ===================== USER CONFIG =====================
@@ -57,6 +57,22 @@ API_CIRCUIT_OPEN = False
 
 RUN_FLAG = True
 PROGRAM_RUNNING = True
+
+# ===== GLOBAL STOP-FOR-DAY CONTROL =====
+DAY_STOP_ACTIVE = False
+DAY_STOP_DATE = None
+
+def _activate_day_stop():
+    global RUN_FLAG, DAY_STOP_ACTIVE, DAY_STOP_DATE
+    RUN_FLAG = False
+    DAY_STOP_ACTIVE = True
+    DAY_STOP_DATE = datetime.now().date()
+
+def _clear_day_stop():
+    global RUN_FLAG, DAY_STOP_ACTIVE, DAY_STOP_DATE
+    RUN_FLAG = True
+    DAY_STOP_ACTIVE = False
+    DAY_STOP_DATE = None
 
 #new code added to fix rate limit and wrong entries
 API_MIN_GAP = 0.45  # seconds (≈ 3 calls/sec total)
@@ -446,15 +462,36 @@ def _api_call(fn: Callable, *args, retries: int = 5, backoff: float = 1.0,
     raise last_exc
 
 def _api_circuit_monitor():
-    global RUN_FLAG
+    global RUN_FLAG, API_CIRCUIT_OPEN
+
+    circuit_notified = False
 
     while PROGRAM_RUNNING:
         with API_FAIL_LOCK:
-            if API_CIRCUIT_OPEN:
-                if RUN_FLAG:
-                    print("🚨 API CIRCUIT OPEN — Pausing Trading")
-                    RUN_FLAG = False
-                    _tg_send("🚨 API Circuit Open. Trading paused.")
+            fail_count = API_FAIL_COUNT
+            circuit_open = API_CIRCUIT_OPEN
+
+        # ================================
+        # 🚨 CIRCUIT OPEN → Pause Trading
+        # ================================
+        if circuit_open:
+            if RUN_FLAG:
+                print("🚨 API CIRCUIT OPEN — Pausing Trading")
+                RUN_FLAG = False
+
+            if not circuit_notified:
+                _tg_send("🚨 API Circuit Open. Trading paused.")
+                circuit_notified = True
+
+        # ====================================
+        # ✅ CIRCUIT RECOVERY → Resume Trading
+        # ====================================
+        else:
+            if circuit_notified:
+                print("✅ API Circuit Recovered — Resuming Trading")
+                RUN_FLAG = True
+                _tg_send("✅ API Circuit Recovered. Trading resumed.")
+                circuit_notified = False
 
         time.sleep(3)
 
@@ -525,7 +562,7 @@ def _telegram_listener():
         try:
             resp = requests.get(
                 f"{base}/getUpdates",
-                params={"timeout": 50, "offset": offset or 0},
+                params={"timeout": 50, "offset": offset},
                 timeout=60
             )
 
@@ -548,6 +585,7 @@ def _telegram_listener():
                 # ======================
                 if text in ("/stop", "stop", "/kill", "kill"):
                     RUN_FLAG = False
+                    _square_off_all_positions("FULL_STOP")
                     PROGRAM_RUNNING = False
 
                     print("🔴 Telegram: FULL STOP command received.")
@@ -564,14 +602,16 @@ def _telegram_listener():
                 # START COMMAND
                 # ======================
                 elif text in ("/startbot", "/resume", "resume", "startbot"):
-                    RUN_FLAG = True
+
                     print("🟢 Telegram: RESUME command received.")
+
+                    _clear_day_stop()
 
                     requests.post(
                         f"{base}/sendMessage",
                         data={
                             "chat_id": chat_id,
-                            "text": "🟢 Bot resumed."
+                            "text": "🟢 Trading resumed."
                         },
                         timeout=10
                     )
@@ -647,7 +687,26 @@ def _telegram_listener():
                         data={"chat_id": chat_id, "text": status_msg},
                         timeout=10
                     )
+                # ======================
+                # STOP FOR THE DAY
+                # ======================
+                elif text in ("/stopday", "stopday", "/stop_today"):
 
+                    print("🛑 Telegram: STOP FOR TODAY received.")
+
+                    _activate_day_stop()
+
+                    # Square off open trades safely
+                    _square_off_all_positions("STOP_DAY")
+
+                    requests.post(
+                        f"{base}/sendMessage",
+                        data={
+                            "chat_id": chat_id,
+                            "text": "🛑 Trading stopped for today.\nOpen positions squared off.\nWill resume only manually or next session."
+                        },
+                        timeout=10
+                    )
         except Exception:
             time.sleep(3)
 # ===== Scrip-master loader & robust LTP =====
@@ -1255,7 +1314,7 @@ def place_market_and_confirm_sell(symbol, token, qty_to_sell, timeout_sec=25, po
 
 ATM_CACHE = {"ts": 0, "data": None}
 
-def fetch_atm_cached(ttl=60):
+def fetch_atm_cached(ttl=20):
     now = time.time()
     if ATM_CACHE["data"] and (now - ATM_CACHE["ts"] < ttl):
         return ATM_CACHE["data"]
@@ -1303,22 +1362,37 @@ class RedGreenEngine(threading.Thread):
         print("")
 
     def _other_leg_in_position(self) -> bool:
-        """
-        Return True if *any* other engine (the opposite leg) currently holds a position.
-        Uses the global ENGINES registry (populated in __main__).
-        """
         try:
+            # Check other engine flag
             for name, eng in ENGINES.items():
                 if name == self.name:
                     continue
                 if getattr(eng, "in_position", False):
                     return True
+
+            # 🔥 HARD CHECK broker level
+            pos = _api_call(lambda: obj.position(), retries=1)
+            rows = pos.get("data", []) if isinstance(pos, dict) else []
+
+            if isinstance(rows, dict) and "netPositions" in rows:
+                rows = rows["netPositions"]
+
+            for r in rows:
+                tok = str(r.get("symboltoken") or r.get("token") or "")
+                q = int(float(r.get("netqty") or r.get("netQty") or 0))
+
+                # Only block if same underlying (BankNifty options)
+                if q > 0 and SPOT_SYMBOL in str(r.get("tradingsymbol") or ""):
+                    return True
+
         except Exception:
-            # conservative: assume other leg may be in position on error
-            return True
+            return True  # conservative
+
         return False
 
     def _detect_and_enter(self, df):
+        if DAY_STOP_ACTIVE:
+            return False
         global TRADING_ENGINE_ACTIVE
         # global DAY_HAS_TRADE
 
@@ -1394,6 +1468,11 @@ class RedGreenEngine(threading.Thread):
                 acquired = True
 
         if not acquired:
+            return False
+
+        if DAY_STOP_ACTIVE:
+            with DAY_STATE_LOCK:
+                TRADING_ENGINE_ACTIVE = False
             return False
 
         try:
@@ -1583,34 +1662,69 @@ class RedGreenEngine(threading.Thread):
             print(f"[{self.name}] stats/notify failed (continuing): {e}")
 
     def _sell_and_exit(self, reason: str) -> bool:
+        """
+        Safely exit position.
+        - Prevents duplicate sells
+        - Confirms sell execution
+        - Does NOT mark position closed if sell fails
+        - Logs only once
+        """
+
+        if not self.in_position:
+            print(f"[{self.name}] No active position. SELL ignored.")
+            return False
+
         if self._exiting:
             print(f"[{self.name}] Exit already in progress; skipping duplicate SELL.")
             return False
+
         self._exiting = True
+
+        sold_qty = 0
 
         try:
             qty = self.position_qty or LOT_SIZE
-            print(f"[{self.name}] placing MARKET SELL qty={qty} symbol={self.symbol} token={self.token}")
-            sold_qty = place_market_and_confirm_sell(self.symbol, self.token, qty, timeout_sec=25, poll_sec=1.0)
+
+            print(
+                f"[{self.name}] placing MARKET SELL qty={qty} "
+                f"symbol={self.symbol} token={self.token}"
+            )
+
+            sold_qty = place_market_and_confirm_sell(
+                self.symbol,
+                self.token,
+                qty,
+                timeout_sec=25,
+                poll_sec=1.0
+            )
+
+            # ===============================
+            # 🔴 SELL NOT CONFIRMED → DO NOT CLOSE POSITION
+            # ===============================
             if sold_qty <= 0:
                 print(f"[{self.name}] ⚠ SELL not confirmed — position may still be open!")
-            # Get actual SELL average price from tradeBook
+                self._exiting = False
+                return False
+
+            # ===============================
+            # ✅ SELL CONFIRMED → Get Exit Price
+            # ===============================
             exit_px = self.entry  # fallback safety
 
             try:
-                try:
-                    tb = _api_call(lambda: obj.tradeBook(), retries=2)
-                    avg_sell = _avg_sell_price_from_tradebook(tb, self.token)
-                except Exception:
-                    avg_sell = None
+                tb = _api_call(lambda: obj.tradeBook(), retries=2)
+                avg_sell = _avg_sell_price_from_tradebook(tb, self.token)
 
                 if avg_sell and avg_sell > 0:
                     exit_px = float(avg_sell)
                 else:
-                    print(f"[{self.name}] WARNING: Could not extract sell avg from tradeBook. Using LTP fallback.")
+                    print(f"[{self.name}] tradeBook avg not found, using LTP fallback.")
                     try:
                         exit_px = float(
-                            _api_call(lambda: obj.ltpData("NFO", self.symbol, self.token), retries=2)["data"]["ltp"]
+                            _api_call(
+                                lambda: obj.ltpData("NFO", self.symbol, self.token),
+                                retries=2
+                            )["data"]["ltp"]
                         )
                     except Exception:
                         exit_px = self.entry
@@ -1618,22 +1732,34 @@ class RedGreenEngine(threading.Thread):
             except Exception as e:
                 print(f"[{self.name}] tradeBook fetch failed: {e}")
 
+            # ===============================
+            # 📊 LOG TRADE
+            # ===============================
             self._exit_and_log(exit_px, reason)
-            return True
-        finally:
+
+            # ===============================
+            # ✅ NOW SAFE TO MARK POSITION CLOSED
+            # ===============================
             self.in_position = False
             self.position_qty = 0
-            # Mark trading as finished (DAY_HAS_TRADE already set on entry) and clear active flag
-            with DAY_STATE_LOCK:
-                global TRADING_ENGINE_ACTIVE
-                TRADING_ENGINE_ACTIVE = False
-                # Clear persisted baseline so bot doesn't think it's still baseline (optional)
-                try:
+
+            # Clear persisted baseline safely
+            try:
+                with DAY_STATE_LOCK:
                     BOT_BASELINES.pop(str(self.token), None)
                     BOT_AVG_ENTRY.pop(str(self.token), None)
                     _persist_state()
-                except Exception:
-                    pass
+            except Exception:
+                pass
+
+            print(f"[{self.name}] ✅ Position fully closed.")
+
+            return True
+
+        except Exception as e:
+            print(f"[{self.name}] SELL EXCEPTION: {e}")
+            self._exiting = False
+            return False
 
     def run(self):
         print(f"[{self.name}] Engine started.")
@@ -1684,7 +1810,7 @@ class RedGreenEngine(threading.Thread):
                 # ============================
                 # ENTRY LOGIC
                 # ============================
-                if not self.in_position and RUN_FLAG and _entry_window_open():
+                if not self.in_position and RUN_FLAG and not DAY_STOP_ACTIVE and _entry_window_open():
 
                     if self._other_leg_in_position():
                         print(f"[{self.name}] Skipping entry because opposite leg already in trade.")
@@ -1707,8 +1833,15 @@ class RedGreenEngine(threading.Thread):
                 # ============================
                 while self.in_position and not _market_closed():
                     if API_CIRCUIT_OPEN:
-                        print(f"[{self.name}] Circuit open — stopping monitor loop.")
-                        break
+                        print(f"[{self.name}] Circuit open — exiting position for safety.")
+                        success = self._sell_and_exit("API_CIRCUIT_EXIT")
+                        if success:
+                            break
+                        else:
+                            print(f"[{self.name}] Circuit exit failed — retrying...")
+                            time.sleep(3)
+                            continue
+                        
                     # Manual exit request
                     req = None
                     with self._exit_req_lock:
@@ -1740,6 +1873,11 @@ class RedGreenEngine(threading.Thread):
                         open_qty = _get_open_qty(self.token)
 
                         if open_qty is not None and open_qty == 0:
+
+                            # 🔐 Prevent duplicate logging if SELL already initiated
+                            if self._exiting:
+                                break
+
                             print(f"[{self.name}] 🔔 Broker auto square-off detected.")
 
                             try:
@@ -1792,6 +1930,20 @@ def _both_legs_flat() -> bool:
     try:
         return bool(ce and pe and (not ce.in_position) and (not pe.in_position))
     except Exception:
+        return False
+
+def _square_off_all_positions(reason="MANUAL_STOP"):
+    try:
+        for name, engine in ENGINES.items():
+            if engine and engine.in_position:
+                print(f"[GLOBAL] Squaring off {name} position...")
+                try:
+                    engine._sell_and_exit(reason)
+                except Exception as e:
+                    print(f"[GLOBAL] Error squaring {name}: {e}")
+        return True
+    except Exception as e:
+        print(f"[GLOBAL] Square-off error: {e}")
         return False
 
 def _should_block_new_entries() -> bool:
@@ -1889,6 +2041,10 @@ if __name__ == "__main__":
         pass
     try:
         while PROGRAM_RUNNING:
+            # ===== AUTO RESET NEXT DAY =====
+            if DAY_STOP_ACTIVE and DAY_STOP_DATE != datetime.now().date():
+                if datetime.now().time() >= _time(9,0) and not API_CIRCUIT_OPEN:
+                    _clear_day_stop()
             now_t = datetime.now().time()
             if _market_closed() or not (_time(8,45) <= now_t <= _time(15,30)):
                 print("🛑 Market closed. Stopping strategy execution.")
