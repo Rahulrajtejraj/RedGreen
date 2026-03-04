@@ -17,6 +17,10 @@ import matplotlib.pyplot as _plt
 from openpyxl import load_workbook as _load_wb
 from openpyxl.drawing.image import Image as _XLImage
 
+import logging
+logging.getLogger("SmartApi.smartConnect").setLevel(logging.CRITICAL)
+logging.getLogger("SmartApi").setLevel(logging.CRITICAL)
+
 # SmartAPI + TOTP
 from SmartApi import SmartConnect
 import pyotp
@@ -46,7 +50,7 @@ LOT_SIZE             = 60
 TARGET_POINTS        = 20
 SL_POINTS            = 18
 BROKERAGE_TAX        = 60
-SLEEP_INTERVAL       = 0.5
+SLEEP_INTERVAL       = 1
 PRE_CLOSE_BUFFER_SEC = 30
 DAILY_TRADE_LIMIT    = 20
 
@@ -57,6 +61,10 @@ API_CIRCUIT_OPEN = False
 
 RUN_FLAG = True
 PROGRAM_RUNNING = True
+
+POSITION_CACHE = {"ts":0,"data":None}
+POSITION_TTL = 2
+POSITION_LOCK = threading.Lock()
 
 # ===== GLOBAL STOP-FOR-DAY CONTROL =====
 DAY_STOP_ACTIVE = False
@@ -74,8 +82,26 @@ def _clear_day_stop():
     DAY_STOP_ACTIVE = False
     DAY_STOP_DATE = None
 
+
+def get_positions_cached():
+
+    global POSITION_CACHE
+
+    now = time.time()
+
+    with POSITION_LOCK:
+
+        if POSITION_CACHE["data"] and now - POSITION_CACHE["ts"] < POSITION_TTL:
+            return POSITION_CACHE["data"]
+
+        pos = _api_call(lambda: obj.position(), retries=2)
+
+        POSITION_CACHE["data"] = pos
+        POSITION_CACHE["ts"] = now
+
+        return pos
 #new code added to fix rate limit and wrong entries
-API_MIN_GAP = 0.45  # seconds (≈ 3 calls/sec total)
+API_MIN_GAP = 0.55  # seconds (≈ 3 calls/sec total)
 _last_api_call_ts = 0.0
 _api_gap_lock = threading.Lock()
 
@@ -822,10 +848,10 @@ def fetch_atm_option_tokens():
     try:
         spot_ltp = None
         try:
-            spot_resp = _api_call(lambda: obj.ltpData("NFO", SPOT_SYMBOL, SPOT_TOKEN), retries=2)
+            spot_resp = _api_call(lambda: obj.ltpData("NSE", SPOT_SYMBOL, SPOT_TOKEN), retries=2)
             spot_ltp = float(spot_resp["data"]["ltp"])
         except Exception:
-            spot_resp = _api_call(lambda: obj.ltpData("NSE", SPOT_SYMBOL, SPOT_TOKEN), retries=2)
+            spot_resp = _api_call(lambda: obj.ltpData("NFO", SPOT_SYMBOL, SPOT_TOKEN), retries=2)
             spot_ltp = float(spot_resp["data"]["ltp"])
     except Exception as e:
         # fallback: try reading from scrip master if it contains a lastPrice-like column (rare)
@@ -1048,7 +1074,7 @@ def _net_exec_qty_from_tradebook(tb, token_str):
 
 def _get_open_qty(symbol_token):
     try:
-        pos = _api_call(lambda: obj.position(), retries=3)
+        pos = get_positions_cached()
         return _extract_net_position_from_positions(pos, symbol_token)
     except Exception as e:
         print(f"[Position Check] position() API failed: {e}")
@@ -1078,7 +1104,7 @@ def _invalidate_and_wait(token, delay=0.25):
     time.sleep(delay)
 
 def place_market_and_confirm_buy(symbol, token, total_qty, side_lock_name=None,
-                                 confirm_timeout=30, poll_sec=1.0, persist_on_confirm=True):
+                                 confirm_timeout=30, poll_sec=1.2, persist_on_confirm=True):
     placed_resp = None
     try:
         payload = {
@@ -1134,7 +1160,7 @@ def place_market_and_confirm_buy(symbol, token, total_qty, side_lock_name=None,
     while time.time() - start < timeout:
         try:
             try:
-                pos = _api_call(lambda: obj.position(), retries=2)
+                pos = _api_call(lambda: get_positions_cached(), retries=2)
             except Exception:
                 pos = None
             debug["positions"] = pos
@@ -1184,7 +1210,7 @@ def place_market_and_confirm_buy(symbol, token, total_qty, side_lock_name=None,
                         if o_tok == str(token) or (order_id and (str(order_id) in str(o.get("orderNo") or o.get("orderId") or ""))):
                             status = (o.get("status") or o.get("orderstatus") or "").lower()
                             text = str(o.get("text") or "")
-                            if "reject" in status or "rejected" in status or "insufficient" in text.lower():
+                            if "reject" in status or "rejected" in status:
                                 if side_lock_name:
                                     try:
                                         with DAY_STATE_LOCK:
@@ -1314,7 +1340,7 @@ def place_market_and_confirm_sell(symbol, token, qty_to_sell, timeout_sec=25, po
 
 ATM_CACHE = {"ts": 0, "data": None}
 
-def fetch_atm_cached(ttl=20):
+def fetch_atm_cached(ttl=30):
     now = time.time()
     if ATM_CACHE["data"] and (now - ATM_CACHE["ts"] < ttl):
         return ATM_CACHE["data"]
@@ -1362,31 +1388,28 @@ class RedGreenEngine(threading.Thread):
         print("")
 
     def _other_leg_in_position(self) -> bool:
-        try:
-            # Check other engine flag
-            for name, eng in ENGINES.items():
-                if name == self.name:
-                    continue
-                if getattr(eng, "in_position", False):
-                    return True
 
-            # 🔥 HARD CHECK broker level
-            pos = _api_call(lambda: obj.position(), retries=1)
+        try:
+
+            pos = get_positions_cached()
+
             rows = pos.get("data", []) if isinstance(pos, dict) else []
 
             if isinstance(rows, dict) and "netPositions" in rows:
                 rows = rows["netPositions"]
 
             for r in rows:
+
                 tok = str(r.get("symboltoken") or r.get("token") or "")
+                sym = str(r.get("tradingsymbol") or "")
                 q = int(float(r.get("netqty") or r.get("netQty") or 0))
 
-                # Only block if same underlying (BankNifty options)
-                if q > 0 and SPOT_SYMBOL in str(r.get("tradingsymbol") or ""):
+                # block only BankNifty options from bot
+                if q > 0 and sym.startswith("BANKNIFTY") and tok != str(self.token):
                     return True
 
         except Exception:
-            return True  # conservative
+            return True
 
         return False
 
@@ -1500,15 +1523,13 @@ class RedGreenEngine(threading.Thread):
 
             if not avg or avg <= 0:
                 try:
-                    avg = float(
-                        _api_call(lambda: obj.ltpData("NFO", self.symbol, self.token), retries=2)["data"]["ltp"]
-                    )
+                    avg = robust_get_ltp("NFO", self.symbol, self.token)
                 except Exception:
                     avg = float(curr["close"])
 
             self.position_qty = filled if filled > 0 else LOT_SIZE
             self.entry = float(avg)
-            self.target = round(self.entry + TARGET_POINTS, 2)
+            self.target = round(self.entry + TARGET_POINTS, 2)  
             self.sl = round(self.entry - SL_POINTS, 2)
             self.entry_volume = int(curr["volume"]) if "volume" in curr.index else 0
             self.in_position = True
