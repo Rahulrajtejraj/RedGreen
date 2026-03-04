@@ -1388,6 +1388,9 @@ class RedGreenEngine(threading.Thread):
 
             pos = get_positions_cached()
 
+            if not pos:
+                return True   # safest: assume position exists
+
             rows = pos.get("data", []) if isinstance(pos, dict) else []
 
             if isinstance(rows, dict) and "netPositions" in rows:
