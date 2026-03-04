@@ -881,19 +881,14 @@ def fetch_atm_option_tokens():
             tok = str(row["token"])
             # try getting LTP for this option
             try:
-                l = _api_call(lambda: obj.ltpData("NFO", sym, tok), retries=2)
-                ltp = float(l["data"]["ltp"])
+                ltp = robust_get_ltp("NFO", sym, tok)
             except Exception:
                 return False, 0.0
+
             if ltp < MIN_OPTION_PREMIUM_LOCAL:
                 return False, ltp
-            # try getting recent volume via candles
-            try:
-                cdf = fetch_candle_data(tok)
-                vol = int(cdf["volume"].iloc[-1]) if cdf is not None and len(cdf) else 0
-            except Exception:
-                vol = 0
-            return True, ltp if vol >= 0 else ltp
+
+            return True, ltp
         except Exception:
             return False, 0.0
 
@@ -1476,11 +1471,6 @@ class RedGreenEngine(threading.Thread):
         if not RUN_FLAG or not _entry_window_open() or _market_closed():
             return False
 
-        # Ensure token already available (avoid redundant API calls)
-        if not self.symbol or not self.token:
-            print(f"[{self.name}] No token available for entry.")
-            return False
-
         # =============================
         # ENTRY LOCK (SAFE VERSION)
         # =============================
@@ -1843,9 +1833,8 @@ class RedGreenEngine(threading.Thread):
                         continue
 
                     try:
-                        entered = self._detect_and_enter(df)
-                        if entered:
-                            self.in_position = True
+                        self._detect_and_enter(df)
+                        
                     except Exception as e:
                         print(f"[{self.name}] enter error: {e}")
 
